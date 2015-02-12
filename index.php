@@ -14,11 +14,6 @@
 	$inject = TRUE;
 	$evilCode = "http://127.0.0.1/hook.js";
 
-	// Set cookie domain
-	$cookieDomain = str_replace("http://www.", "", $target);
-	$cookieDomain = str_replace("https://www.", "", $cookieDomain);
-	$cookieDomain = str_replace("www.", "", $cookieDomain);
-
 	function randToken() {
 		return sprintf('%06X', mt_rand(0, 0xFFFFFF));
 	}
